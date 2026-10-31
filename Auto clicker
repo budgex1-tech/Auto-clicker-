@@ -1,0 +1,1306 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AutoClicker"
+          include(":app")
+          EOF_FILE
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p .
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.autoclicker"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.autoclicker"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="AutoClicker"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".ClickService"
+                      android:exported="false"
+                      android:label="AutoClicker"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="service_desc">Performs taps and swipes for the AutoClicker overlay.</string>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/autoclicker
+          cat > app/src/main/java/com/example/autoclicker/MainActivity.kt <<'EOF_FILE'
+          package com.example.autoclicker
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(60, 60, 60, 60)
+                  }
+                  col.addView(TextView(this).apply {
+                      text = "1. Tap below and enable AutoClicker under Accessibility.\n" +
+                          "2. A floating bar appears on screen.\n" +
+                          "3. Drag the markers to where you want to tap (or swipe from A to B).\n" +
+                          "4. Hit ▶ to start, ■ to stop."
+                      textSize = 16f
+                  })
+                  col.addView(Button(this).apply {
+                      text = "Open Accessibility Settings"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  setContentView(col)
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/autoclicker
+          cat > app/src/main/java/com/example/autoclicker/ClickService.kt <<'EOF_FILE'
+          package com.example.autoclicker
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class ClickService : AccessibilityService() {
+
+              private lateinit var wm: WindowManager
+              private val handler = Handler(Looper.getMainLooper())
+
+              private var running = false
+              private var dragMode = false
+              private var cps = 16
+              private val burst = 4            // strokes per gesture (max allowed is 10)
+              private val markerSize = 90
+
+              private lateinit var panel: LinearLayout
+              private lateinit var markerA: TextView
+              private lateinit var markerB: TextView
+              private lateinit var startBtn: Button
+              private lateinit var modeBtn: Button
+              private lateinit var cpsLabel: TextView
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  buildMarkers()
+                  buildPanel()
+              }
+
+              // ---------- UI ----------
+
+              private fun overlayParams(w: Int, h: Int, x: Int, y: Int) = WindowManager.LayoutParams(
+                  w, h,
+                  WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                  PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.START; this.x = x; this.y = y }
+
+              private fun makeMarker(label: String, color: Int, x: Int, y: Int): TextView {
+                  val tv = TextView(this).apply {
+                      text = label
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      textSize = 16f
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(color and 0x00FFFFFF or 0x99000000.toInt())
+                          setStroke(4, Color.WHITE)
+                      }
+                  }
+                  val lp = overlayParams(markerSize, markerSize, x, y)
+                  tv.setOnTouchListener(dragListener(tv, lp))
+                  wm.addView(tv, lp)
+                  return tv
+              }
+
+              private fun buildMarkers() {
+                  markerA = makeMarker("A", Color.RED, 400, 900)
+                  markerB = makeMarker("B", Color.BLUE, 400, 1300)
+                  markerB.visibility = View.GONE
+              }
+
+              private fun dragListener(v: View, lp: WindowManager.LayoutParams): View.OnTouchListener {
+                  var sx = 0; var sy = 0; var tx = 0f; var ty = 0f
+                  return View.OnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY }
+                          MotionEvent.ACTION_MOVE -> {
+                              lp.x = sx + (e.rawX - tx).toInt()
+                              lp.y = sy + (e.rawY - ty).toInt()
+                              wm.updateViewLayout(v, lp)
+                          }
+                      }
+                      true
+                  }
+              }
+
+              private fun buildPanel() {
+                  val ctx = this
+                  panel = LinearLayout(ctx).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setBackgroundColor(0xDD222222.toInt())
+                      setPadding(8, 8, 8, 8)
+                  }
+                  val handle = TextView(ctx).apply {
+                      text = "⠿"; textSize = 22f; setTextColor(Color.WHITE)
+                      setPadding(16, 0, 16, 0); gravity = Gravity.CENTER
+                  }
+                  startBtn = Button(ctx).apply { text = "▶"; setOnClickListener { toggle() } }
+                  modeBtn = Button(ctx).apply { text = "TAP"; setOnClickListener { toggleMode() } }
+                  val minus = Button(ctx).apply { text = "−"; setOnClickListener { setCps(cps - 1) } }
+                  cpsLabel = TextView(ctx).apply {
+                      text = "$cps"; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                      setPadding(12, 0, 12, 0)
+                  }
+                  val plus = Button(ctx).apply { text = "+"; setOnClickListener { setCps(cps + 1) } }
+                  listOf(handle, startBtn, modeBtn, minus, cpsLabel, plus).forEach { panel.addView(it) }
+
+                  val lp = overlayParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT, 40, 200
+                  )
+                  handle.setOnTouchListener(dragListener(panel, lp))
+                  wm.addView(panel, lp)
+              }
+
+              private fun setCps(v: Int) {
+                  cps = v.coerceIn(1, 30)
+                  cpsLabel.text = "$cps"
+              }
+
+              private fun toggleMode() {
+                  dragMode = !dragMode
+                  modeBtn.text = if (dragMode) "DRAG" else "TAP"
+                  markerB.visibility = if (dragMode) View.VISIBLE else View.GONE
+              }
+
+              // Markers ignore touches while running so clicks pass through to the app below
+              private fun setMarkersTouchable(touchable: Boolean) {
+                  for (m in listOf(markerA, markerB)) {
+                      val lp = m.layoutParams as WindowManager.LayoutParams
+                      lp.flags = if (touchable) lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                      else lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                      wm.updateViewLayout(m, lp)
+                  }
+              }
+
+              // ---------- Clicking ----------
+
+              private fun center(m: View): Pair<Float, Float> {
+                  val lp = m.layoutParams as WindowManager.LayoutParams
+                  return Pair(lp.x + markerSize / 2f, lp.y + markerSize / 2f)
+              }
+
+              private fun toggle() {
+                  running = !running
+                  startBtn.text = if (running) "■" else "▶"
+                  setMarkersTouchable(!running)
+                  if (running) handler.post(loop)
+              }
+
+              private vaname: build apk
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: write project files
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p .
+          cat > settings.gradle.kts <<'eof_file'
+          pluginmanagement { repositories { google(); mavencentral(); gradlepluginportal() } }
+          dependencyresolutionmanagement { repositories { google(); mavencentral() } }
+          rootproject.name = "autoclicker"
+          include(":app")
+          eof_file
+          mkdir -p .
+          cat > build.gradle.kts <<'eof_file'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          eof_file
+          mkdir -p .
+          cat > gradle.properties <<'eof_file'
+          android.useandroidx=true
+          org.gradle.jvmargs=-xmx2g
+          eof_file
+          mkdir -p app
+          cat > app/build.gradle.kts <<'eof_file'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.autoclicker"
+              compilesdk = 34
+              defaultconfig {
+                  applicationid = "com.example.autoclicker"
+                  minsdk = 24
+                  targetsdk = 34
+                  versioncode = 1
+                  versionname = "1.0"
+              }
+              compileoptions {
+                  sourcecompatibility = javaversion.version_17
+                  targetcompatibility = javaversion.version_17
+              }
+              kotlinoptions { jvmtarget = "17" }
+          }
+          eof_file
+          mkdir -p app/src/main
+          cat > app/src/main/androidmanifest.xml <<'eof_file'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="autoclicker"
+                  android:theme="@android:style/theme.devicedefault.light.noactionbar">
+                  <activity android:name=".mainactivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.main" />
+                          <category android:name="android.intent.category.launcher" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".clickservice"
+                      android:exported="false"
+                      android:label="autoclicker"
+                      android:permission="android.permission.bind_accessibility_service">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.accessibilityservice" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          eof_file
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'eof_file'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityeventtypes="typeallmask"
+              android:accessibilityfeedbacktype="feedbackgeneric"
+              android:canperformgestures="true"
+              android:description="@string/service_desc"
+              android:notificationtimeout="100" />
+          eof_file
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'eof_file'
+          <resources>
+              <string name="service_desc">performs taps and swipes for the autoclicker overlay.</string>
+          </resources>
+          eof_file
+          mkdir -p app/src/main/java/com/example/autoclicker
+          cat > app/src/main/java/com/example/autoclicker/mainactivity.kt <<'eof_file'
+          package com.example.autoclicker
+
+          import android.app.activity
+          import android.content.intent
+          import android.os.bundle
+          import android.provider.settings
+          import android.view.gravity
+          import android.widget.button
+          import android.widget.linearlayout
+          import android.widget.textview
+
+          class mainactivity : activity() {
+              override fun oncreate(b: bundle?) {
+                  super.oncreate(b)
+                  val col = linearlayout(this).apply {
+                      orientation = linearlayout.vertical
+                      gravity = gravity.center
+                      setpadding(60, 60, 60, 60)
+                  }
+                  col.addview(textview(this).apply {
+                      text = "1. tap below and enable autoclicker under accessibility.\n" +
+                          "2. a floating bar appears on screen.\n" +
+                          "3. drag the markers to where you want to tap (or swipe from a to b).\n" +
+                          "4. hit ▶ to start, ■ to stop."
+                      textsize = 16f
+                  })
+                  col.addview(button(this).apply {
+                      text = "open accessibility settings"
+                      setonclicklistener { startactivity(intent(settings.action_accessibility_settings)) }
+                  })
+                  setcontentview(col)
+              }
+          }
+          eof_file
+          mkdir -p app/src/main/java/com/example/autoclicker
+          cat > app/src/main/java/com/example/autoclicker/clickservice.kt <<'eof_file'
+          package com.example.autoclicker
+
+          import android.accessibilityservice.accessibilityservice
+          import android.accessibilityservice.gesturedescription
+          import android.graphics.color
+          import android.graphics.path
+          import android.graphics.pixelformat
+          import android.graphics.drawable.gradientdrawable
+          import android.os.handler
+          import android.os.looper
+          import android.view.gravity
+          import android.view.motionevent
+          import android.view.view
+          import android.view.windowmanager
+          import android.view.accessibility.accessibilityevent
+          import android.widget.button
+          import android.widget.linearlayout
+          import android.widget.textview
+
+          class clickservice : accessibilityservice() {
+
+              private lateinit var wm: windowmanager
+              private val handler = handler(looper.getmainlooper())
+
+              private var running = false
+              private var dragmode = false
+              private var cps = 16
+              private val burst = 4            // strokes per gesture (max allowed is 10)
+              private val markersize = 90
+
+              private lateinit var panel: linearlayout
+              private lateinit var markera: textview
+              private lateinit var markerb: textview
+              private lateinit var startbtn: button
+              private lateinit var modebtn: button
+              private lateinit var cpslabel: textview
+
+              override fun onserviceconnected() {
+                  wm = getsystemservice(window_service) as windowmanager
+                  buildmarkers()
+                  buildpanel()
+              }
+
+              // ---------- ui ----------
+
+              private fun overlayparams(w: int, h: int, x: int, y: int) = windowmanager.layoutparams(
+                  w, h,
+                  windowmanager.layoutparams.type_accessibility_overlay,
+                  windowmanager.layoutparams.flag_not_focusable or
+                      windowmanager.layoutparams.flag_layout_no_limits or
+                      windowmanager.layoutparams.flag_layout_in_screen,
+                  pixelformat.translucent
+              ).apply { gravity = gravity.top or gravity.start; this.x = x; this.y = y }
+
+              private fun makemarker(label: string, color: int, x: int, y: int): textview {
+                  val tv = textview(this).apply {
+                      text = label
+                      settextcolor(color.white)
+                      gravity = gravity.center
+                      textsize = 16f
+                      background = gradientdrawable().apply {
+                          shape = gradientdrawable.oval
+                          setcolor(color and 0x00ffffff or 0x99000000.toint())
+                          setstroke(4, color.white)
+                      }
+                  }
+                  val lp = overlayparams(markersize, markersize, x, y)
+                  tv.setontouchlistener(draglistener(tv, lp))
+                  wm.addview(tv, lp)
+                  return tv
+              }
+
+              private fun buildmarkers() {
+                  markera = makemarker("a", color.red, 400, 900)
+                  markerb = makemarker("b", color.blue, 400, 1300)
+                  markerb.visibility = view.gone
+              }
+
+              private fun draglistener(v: view, lp: windowmanager.layoutparams): view.ontouchlistener {
+                  var sx = 0; var sy = 0; var tx = 0f; var ty = 0f
+                  return view.ontouchlistener { _, e ->
+                      when (e.action) {
+                          motionevent.action_down -> { sx = lp.x; sy = lp.y; tx = e.rawx; ty = e.rawy }
+                          motionevent.action_move -> {
+                              lp.x = sx + (e.rawx - tx).toint()
+                              lp.y = sy + (e.rawy - ty).toint()
+                              wm.updateviewlayout(v, lp)
+                          }
+                      }
+                      true
+                  }
+              }
+
+              private fun buildpanel() {
+                  val ctx = this
+                  panel = linearlayout(ctx).apply {
+                      orientation = linearlayout.horizontal
+                      setbackgroundcolor(0xdd222222.toint())
+                      setpadding(8, 8, 8, 8)
+                  }
+                  val handle = textview(ctx).apply {
+                      text = "⠿"; textsize = 22f; settextcolor(color.white)
+                      setpadding(16, 0, 16, 0); gravity = gravity.center
+                  }
+                  startbtn = button(ctx).apply { text = "▶"; setonclicklistener { toggle() } }
+                  modebtn = button(ctx).apply { text = "tap"; setonclicklistener { togglemode() } }
+                  val minus = button(ctx).apply { text = "−"; setonclicklistener { setcps(cps - 1) } }
+                  cpslabel = textview(ctx).apply {
+                      text = "$cps"; settextcolor(color.white); gravity = gravity.center
+                      setpadding(12, 0, 12, 0)
+                  }
+                  val plus = button(ctx).apply { text = "+"; setonclicklistener { setcps(cps + 1) } }
+                  listof(handle, startbtn, modebtn, minus, cpslabel, plus).foreach { panel.addview(it) }
+
+                  val lp = overlayparams(
+                      windowmanager.layoutparams.wrap_content,
+                      windowmanager.layoutparams.wrap_content, 40, 200
+                  )
+                  handle.setontouchlistener(draglistener(panel, lp))
+                  wm.addview(panel, lp)
+              }
+
+              private fun setcps(v: int) {
+                  cps = v.coercein(1, 30)
+                  cpslabel.text = "$cps"
+              }
+
+              private fun togglemode() {
+                  dragmode = !dragmode
+                  modebtn.text = if (dragmode) "drag" else "tap"
+                  markerb.visibility = if (dragmode) view.visible else view.gone
+              }
+
+              // markers ignore touches while running so clicks pass through to the app below
+              private fun setmarkerstouchable(touchable: boolean) {
+                  for (m in listof(markera, markerb)) {
+                      val lp = m.layoutparams as windowmanager.layoutparams
+                      lp.flags = if (touchable) lp.flags and windowmanager.layoutparams.flag_not_touchable.inv()
+                      else lp.flags or windowmanager.layoutparams.flag_not_touchable
+                      wm.updateviewlayout(m, lp)
+                  }
+              }
+
+              // ---------- clicking ----------
+
+              private fun center(m: view): pair<float, float> {
+                  val lp = m.layoutparams as windowmanager.layoutparams
+                  return pair(lp.x + markersize / 2f, lp.y + markersize / 2f)
+              }
+
+              private fun toggle() {
+                  running = !running
+                  startbtn.text = if (running) "■" else "▶"
+                  setmarkerstouchable(!running)
+                  if (running) handler.post(loop)
+              }
+
+              private val loop = object : runnable {
+                  override fun run() {
+                      if (!running) return
+                      val gap = 1000l / cps
+                      val (ax, ay) = center(markera)
+                      val path = path().apply {
+                          moveto(ax, ay)
+                          if (dragmode) { val (bx, by) = center(markerb); lineto(bx, by) }
+                      }
+                      val dur = if (dragmode) (gap - 5).coerceatleast(1) else 10l
+                      val g = gesturedescription.builder()
+                      for (i in 0 until burst) {
+                          g.addstroke(gesturedescription.strokedescription(path, i * gap, dur))
+                      }
+                      dispatchgesture(g.build(), null, null)
+                      handler.postdelayed(this, burst * gap)
+                  }
+              }
+
+              override fun onaccessibilityevent(e: accessibilityevent?) {}
+              override fun oninterrupt() { running = false }
+
+              override fun ondestroy() {
+                  running = false
+                  for (v in listof(panel, markera, markerb)) runcatching { wm.removeview(v) }
+                  super.ondestroy()
+              }
+          }
+          eof_file
+      - name: build
+        working-directory: proj
+        run: gradle assembledebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autoclicker-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AutoClicker"
+          include(":app")
+          EOF_FILE
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p .
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.autoclicker"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.autoclicker"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="AutoClicker"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".ClickService"
+                      android:exported="false"
+                      android:label="AutoClicker"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="service_desc">Performs taps and swipes for the AutoClicker overlay.</string>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/autoclicker
+          cat > app/src/main/java/com/example/autoclicker/MainActivity.kt <<'EOF_FILE'
+          package com.example.autoclicker
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(60, 60, 60, 60)
+                  }
+                  col.addView(TextView(this).apply {
+                      text = "1. Tap below and enable AutoClicker under Accessibility.\n" +
+                          "2. A floating bar appears on screen.\n" +
+                          "3. Drag the markers to where you want to tap (or swipe from A to B).\n" +
+                          "4. Hit ▶ to start, ■ to stop."
+                      textSize = 16f
+                  })
+                  col.addView(Button(this).apply {
+                      text = "Open Accessibility Settings"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  setContentView(col)
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/autoclicker
+          cat > app/src/main/java/com/example/autoclicker/ClickService.kt <<'EOF_FILE'
+          package com.example.autoclicker
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class ClickService : AccessibilityService() {
+
+              private lateinit var wm: WindowManager
+              private val handler = Handler(Looper.getMainLooper())
+
+              private var running = false
+              private var dragMode = false
+              private var cps = 16
+              private val burst = 4            // strokes per gesture (max allowed is 10)
+              private val markerSize = 90
+
+              private lateinit var panel: LinearLayout
+              private lateinit var markerA: TextView
+              private lateinit var markerB: TextView
+              private lateinit var startBtn: Button
+              private lateinit var modeBtn: Button
+              private lateinit var cpsLabel: TextView
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  buildMarkers()
+                  buildPanel()
+              }
+
+              // ---------- UI ----------
+
+              private fun overlayParams(w: Int, h: Int, x: Int, y: Int) = WindowManager.LayoutParams(
+                  w, h,
+                  WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                  PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.START; this.x = x; this.y = y }
+
+              private fun makeMarker(label: String, color: Int, x: Int, y: Int): TextView {
+                  val tv = TextView(this).apply {
+                      text = label
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      textSize = 16f
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(color and 0x00FFFFFF or 0x99000000.toInt())
+                          setStroke(4, Color.WHITE)
+                      }
+                  }
+                  val lp = overlayParams(markerSize, markerSize, x, y)
+                  tv.setOnTouchListener(dragListener(tv, lp))
+                  wm.addView(tv, lp)
+                  return tv
+              }
+
+              private fun buildMarkers() {
+                  markerA = makeMarker("A", Color.RED, 400, 900)
+                  markerB = makeMarker("B", Color.BLUE, 400, 1300)
+                  markerB.visibility = View.GONE
+              }
+
+              private fun dragListener(v: View, lp: WindowManager.LayoutParams): View.OnTouchListener {
+                  var sx = 0; var sy = 0; var tx = 0f; var ty = 0f
+                  return View.OnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY }
+                          MotionEvent.ACTION_MOVE -> {
+                              lp.x = sx + (e.rawX - tx).toInt()
+                              lp.y = sy + (e.rawY - ty).toInt()
+                              wm.updateViewLayout(v, lp)
+                          }
+                      }
+                      true
+                  }
+              }
+
+              private fun buildPanel() {
+                  val ctx = this
+                  panel = LinearLayout(ctx).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setBackgroundColor(0xDD222222.toInt())
+                      setPadding(8, 8, 8, 8)
+                  }
+                  val handle = TextView(ctx).apply {
+                      text = "⠿"; textSize = 22f; setTextColor(Color.WHITE)
+                      setPadding(16, 0, 16, 0); gravity = Gravity.CENTER
+                  }
+                  startBtn = Button(ctx).apply { text = "▶"; setOnClickListener { toggle() } }
+                  modeBtn = Button(ctx).apply { text = "TAP"; setOnClickListener { toggleMode() } }
+                  val minus = Button(ctx).apply { text = "−"; setOnClickListener { setCps(cps - 1) } }
+                  cpsLabel = TextView(ctx).apply {
+                      text = "$cps"; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                      setPadding(12, 0, 12, 0)
+                  }
+                  val plus = Button(ctx).apply { text = "+"; setOnClickListener { setCps(cps + 1) } }
+                  listOf(handle, startBtn, modeBtn, minus, cpsLabel, plus).forEach { panel.addView(it) }
+
+                  val lp = overlayParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT, 40, 200
+                  )
+                  handle.setOnTouchListener(dragListener(panel, lp))
+                  wm.addView(panel, lp)
+              }
+
+              private fun setCps(v: Int) {
+                  cps = v.coerceIn(1, 30)
+                  cpsLabel.text = "$cps"
+              }
+
+              private fun toggleMode() {
+                  dragMode = !dragMode
+                  modeBtn.text = if (dragMode) "DRAG" else "TAP"
+                  markerB.visibility = if (dragMode) View.VISIBLE else View.GONE
+              }
+
+              // Markers ignore touches while running so clicks pass through to the app below
+              private fun setMarkersTouchable(touchable: Boolean) {
+                  for (m in listOf(markerA, markerB)) {
+                      val lp = m.layoutParams as WindowManager.LayoutParams
+                      lp.flags = if (touchable) lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                      else lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                      wm.updateViewLayout(m, lp)
+                  }
+              }
+
+              // ---------- Clicking ----------
+
+              private fun center(m: View): Pair<Float, Float> {
+                  val lp = m.layoutParams as WindowManager.LayoutParams
+                  return Pair(lp.x + markerSize / 2f, lp.y + markerSize / 2f)
+              }
+
+              private fun toggle() {
+                  running = !running
+                  startBtn.text = if (running) "■" else "▶"
+                  setMarkersTouchable(!running)
+                  if (running) handler.post(loop)
+              }
+
+              private val loop = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      val gap = 1000L / cps
+                      val (ax, ay) = center(markerA)
+                      val path = Path().apply {
+                          moveTo(ax, ay)
+                          if (dragMode) { val (bx, by) = center(markerB); lineTo(bx, by) }
+                      }
+                      val dur = if (dragMode) (gap - 5).coerceAtLeast(1) else 10L
+                      val g = GestureDescription.Builder()
+                      for (i in 0 until burst) {
+                          g.addStroke(GestureDescription.StrokeDescription(path, i * gap, dur))
+                      }
+                      dispatchGesture(g.build(), null, null)
+                      handler.postDelayed(this, burst * gap)
+                  }
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() { running = false }
+
+              override fun onDestroy() {
+                  running = false
+                  for (v in listOf(panel, markerA, markerB)) runCatching { wm.removeView(v) }
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+      - name: Build
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoClicker-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apkname: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AutoClicker"
+          include(":app")
+          EOF_FILE
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p .
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.autoclicker"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.autoclicker"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="AutoClicker"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".ClickService"
+                      android:exported="false"
+                      android:label="AutoClicker"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="service_desc">Performs taps and swipes for the AutoClicker overlay.</string>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/autoclicker
+          cat > app/src/main/java/com/example/autoclicker/MainActivity.kt <<'EOF_FILE'
+          package com.example.autoclicker
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(60, 60, 60, 60)
+                  }
+                  col.addView(TextView(this).apply {
+                      text = "1. Tap below and enable AutoClicker under Accessibility.\n" +
+                          "2. A floating bar appears on screen.\n" +
+                          "3. Drag the markers to where you want to tap (or swipe from A to B).\n" +
+                          "4. Hit ▶ to start, ■ to stop."
+                      textSize = 16f
+                  })
+                  col.addView(Button(this).apply {
+                      text = "Open Accessibility Settings"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  setContentView(col)
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/autoclicker
+          cat > app/src/main/java/com/example/autoclicker/ClickService.kt <<'EOF_FILE'
+          package com.example.autoclicker
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class ClickService : AccessibilityService() {
+
+              private lateinit var wm: WindowManager
+              private val handler = Handler(Looper.getMainLooper())
+
+              private var running = false
+              private var dragMode = false
+              private var cps = 16
+              private val burst = 4            // strokes per gesture (max allowed is 10)
+              private val markerSize = 90
+
+              private lateinit var panel: LinearLayout
+              private lateinit var markerA: TextView
+              private lateinit var markerB: TextView
+              private lateinit var startBtn: Button
+              private lateinit var modeBtn: Button
+              private lateinit var cpsLabel: TextView
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  buildMarkers()
+                  buildPanel()
+              }
+
+              // ---------- UI ----------
+
+              private fun overlayParams(w: Int, h: Int, x: Int, y: Int) = WindowManager.LayoutParams(
+                  w, h,
+                  WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                  PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.START; this.x = x; this.y = y }
+
+              private fun makeMarker(label: String, color: Int, x: Int, y: Int): TextView {
+                  val tv = TextView(this).apply {
+                      text = label
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      textSize = 16f
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(color and 0x00FFFFFF or 0x99000000.toInt())
+                          setStroke(4, Color.WHITE)
+                      }
+                  }
+                  val lp = overlayParams(markerSize, markerSize, x, y)
+                  tv.setOnTouchListener(dragListener(tv, lp))
+                  wm.addView(tv, lp)
+                  return tv
+              }
+
+              private fun buildMarkers() {
+                  markerA = makeMarker("A", Color.RED, 400, 900)
+                  markerB = makeMarker("B", Color.BLUE, 400, 1300)
+                  markerB.visibility = View.GONE
+              }
+
+              private fun dragListener(v: View, lp: WindowManager.LayoutParams): View.OnTouchListener {
+                  var sx = 0; var sy = 0; var tx = 0f; var ty = 0f
+                  return View.OnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY }
+                          MotionEvent.ACTION_MOVE -> {
+                              lp.x = sx + (e.rawX - tx).toInt()
+                              lp.y = sy + (e.rawY - ty).toInt()
+                              wm.updateViewLayout(v, lp)
+                          }
+                      }
+                      true
+                  }
+              }
+
+              private fun buildPanel() {
+                  val ctx = this
+                  panel = LinearLayout(ctx).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setBackgroundColor(0xDD222222.toInt())
+                      setPadding(8, 8, 8, 8)
+                  }
+                  val handle = TextView(ctx).apply {
+                      text = "⠿"; textSize = 22f; setTextColor(Color.WHITE)
+                      setPadding(16, 0, 16, 0); gravity = Gravity.CENTER
+                  }
+                  startBtn = Button(ctx).apply { text = "▶"; setOnClickListener { toggle() } }
+                  modeBtn = Button(ctx).apply { text = "TAP"; setOnClickListener { toggleMode() } }
+                  val minus = Button(ctx).apply { text = "−"; setOnClickListener { setCps(cps - 1) } }
+                  cpsLabel = TextView(ctx).apply {
+                      text = "$cps"; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                      setPadding(12, 0, 12, 0)
+                  }
+                  val plus = Button(ctx).apply { text = "+"; setOnClickListener { setCps(cps + 1) } }
+                  listOf(handle, startBtn, modeBtn, minus, cpsLabel, plus).forEach { panel.addView(it) }
+
+                  val lp = overlayParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT, 40, 200
+                  )
+                  handle.setOnTouchListener(dragListener(panel, lp))
+                  wm.addView(panel, lp)
+              }
+
+              private fun setCps(v: Int) {
+                  cps = v.coerceIn(1, 30)
+                  cpsLabel.text = "$cps"
+              }
+
+              private fun toggleMode() {
+                  dragMode = !dragMode
+                  modeBtn.text = if (dragMode) "DRAG" else "TAP"
+                  markerB.visibility = if (dragMode) View.VISIBLE else View.GONE
+              }
+
+              // Markers ignore touches while running so clicks pass through to the app below
+              private fun setMarkersTouchable(touchable: Boolean) {
+                  for (m in listOf(markerA, markerB)) {
+                      val lp = m.layoutParams as WindowManager.LayoutParams
+                      lp.flags = if (touchable) lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                      else lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                      wm.updateViewLayout(m, lp)
+                  }
+              }
+
+              // ---------- Clicking ----------
+
+              private fun center(m: View): Pair<Float, Float> {
+                  val lp = m.layoutParams as WindowManager.LayoutParams
+                  return Pair(lp.x + markerSize / 2f, lp.y + markerSize / 2f)
+              }
+
+              private fun toggle() {
+                  running = !running
+                  startBtn.text = if (running) "■" else "▶"
+                  setMarkersTouchable(!running)
+                  if (running) handler.post(loop)
+              }
+
+              private val loop = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      val gap = 1000L / cps
+                      val (ax, ay) = center(markerA)
+                      val path = Path().apply {
+                          moveTo(ax, ay)
+                          if (dragMode) { val (bx, by) = center(markerB); lineTo(bx, by) }
+                      }
+                      val dur = if (dragMode) (gap - 5).coerceAtLeast(1) else 10L
+                      val g = GestureDescription.Builder()
+                      for (i in 0 until burst) {
+                          g.addStroke(GestureDescription.StrokeDescription(path, i * gap, dur))
+                      }
+                      dispatchGesture(g.build(), null, null)
+                      handler.postDelayed(this, burst * gap)
+                  }
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() { running = false }
+
+              override fun onDestroy() {
+                  running = false
+                  for (v in listOf(panel, markerA, markerB)) runCatching { wm.removeView(v) }
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+      - name: Build
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoClicker-apk
+          path: proj/app/build/outputs/apk/debug/ap
